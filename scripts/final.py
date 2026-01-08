@@ -2,308 +2,254 @@ import mujoco as mj
 from mujoco.glfw import glfw
 import numpy as np
 import os
+import matplotlib.pyplot as plt  # 绘图库
 
+# ==========================================
+# 1. 核心参数与配置
+# ==========================================
+SLOWDOWN_FACTOR = 0.3    # 全局速度调节因子
+RENDER_BATCH_SIZE = 100   # 每帧渲染的仿真步数
+DRAW_SKIP_STEP = 1       # 轨迹点绘制间隔
+MAX_GEOM_LIMIT = 200000   # 最大几何体数量
 
-# For callback functions
-button_left = False
-button_middle = False
-button_right = False
-lastx = 0
-lasty = 0
+USE_BEZIER = True      # 是否使用贝塞尔曲线插值，False 则使用线性插值 
+USE_SMOOTH_STEP = True  
+DYNAMIC_THICKNESS = True 
 
+X_MIN, X_MAX = -0.5, 0.5
+Y_MIN, Y_MAX = 0.1, 0.6
+Z_WRITE = 0.1      
+PADDING = 0.5  # 字体边距比例          
 
-# --- 核心改进：高稳定性 IK 控制器 ---
-def IK_controller(model, data, X_ref, q_pos):
-    site_id = 0  # 末端 site 的索引
-    
-    current_pos = data.site_xpos[site_id]
-    current_mat = data.site_xmat[site_id].reshape(3, 3)
+Q_STOP = np.array([0.0, -2.32, -1.38, -2.45, 1.57, 0.0])
+STOP_MOVE_DURATION = 1.0  
 
-    # 目标旋转：笔尖垂直向下
-    R_ref = np.array([
-        [1,  0,  0],
-        [0, -1,  0],
-        [0,  0, -1]
-    ])
+button_left, button_right = False, False
+lastx, lasty = 0, 0
 
-    # 1. 计算位置和旋转误差
-    pos_err = X_ref - current_pos
-    # 旋转误差：使用叉乘法计算当前姿态与目标姿态的偏差
-    rot_err = 0.5 * (
-        np.cross(current_mat[:, 0], R_ref[:, 0]) +
-        np.cross(current_mat[:, 1], R_ref[:, 1]) +
-        np.cross(current_mat[:, 2], R_ref[:, 2])
-    )
-    
-    full_err = np.concatenate([pos_err, rot_err])
-    err_norm = np.linalg.norm(full_err)
-    
-    # 2. 极其微小的死区，防止静止时的数值震荡
-    if err_norm < 1e-4:
-        return q_pos
-    
-    # 3. 计算 site 雅可比
-    jacp = np.zeros((3, model.nv))
-    jacr = np.zeros((3, model.nv))
-    mj.mj_jacSite(model, data, jacp, jacr, site_id)
-    J = np.vstack([jacp, jacr])
+# ==========================================
+# 2. 插值函数库
+# ==========================================
+def get_linear_plan(pts, step_dur=0.01):
+    segments = []
+    for i in range(len(pts) - 1):
+        segments.append((pts[i], pts[i+1], step_dur * SLOWDOWN_FACTOR, True))
+    return segments
 
-    # 4. 阻尼最小二乘法 (Damped Least Squares)
-    # 较大的 damping (0.15) 能有效吸收奇点附近的无穷大速度，解决“抽风”
-    damping = 0.15
-    I = np.eye(6)
-    # 公式: dq = J^T * (J*J^T + λ^2*I)^-1 * error
-    dq = J.T @ np.linalg.solve(J @ J.T + damping**2 * I, full_err)
+def get_bezier_plan(pts, step_dur=0.01, sub_steps=5):
+    def bezier_calc(p0, p1, p2, t):
+        return (1 - t)**2 * p0 + 2 * (1 - t) * t * p1 + t**2 * p2
+    segments = []
+    if len(pts) < 3: return get_linear_plan(pts, step_dur) 
+    for i in range(len(pts) - 2):
+        p0, p1, p2 = pts[i], pts[i+1], pts[i+2]
+        for j in range(sub_steps):
+            t0, t1 = j/sub_steps, (j+1)/sub_steps
+            segments.append((bezier_calc(p0, p1, p2, t0), 
+                             bezier_calc(p0, p1, p2, t1), 
+                             (step_dur/sub_steps) * SLOWDOWN_FACTOR, True))
+    return segments
 
-    # 5. 步长强制截断 (Clamping)
-    # 限制单步关节最大位移（弧度），防止物理引擎因位置突跳崩溃
-    max_step = 0.02 
-    actual_step_norm = np.linalg.norm(dq)
-    if actual_step_norm > max_step:
-        dq = dq * (max_step / actual_step_norm)
+def s_curve_interp(t):
+    return t * t * (3 - 2 * t)
 
-    # 6. 控制增益 (Alpha)
-    alpha = 0.5
-    return q_pos + dq * alpha
-
-    
-def controller(model, data):
-    #put the controller here. This function is called inside the simulation.
-    pass
-
-def keyboard(window, key, scancode, act, mods):
-    if act == glfw.PRESS and key == glfw.KEY_BACKSPACE:
-        mj.mj_resetData(model, data)
-        mj.mj_forward(model, data)
-
+# ==========================================
+# 3. 辅助功能 (视角、IK)
+# ==========================================
 def mouse_button(window, button, act, mods):
-    # update button state
-    global button_left
-    global button_middle
-    global button_right
-
-    button_left = (glfw.get_mouse_button(
-        window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS)
-    button_middle = (glfw.get_mouse_button(
-        window, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS)
-    button_right = (glfw.get_mouse_button(
-        window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS)
-
-    # update mouse position
-    glfw.get_cursor_pos(window)
+    global button_left, button_right
+    button_left = (glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS)
+    button_right = (glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS)
 
 def mouse_move(window, xpos, ypos):
-    # compute mouse displacement, save
-    global lastx
-    global lasty
-    global button_left
-    global button_middle
-    global button_right
-
-    dx = xpos - lastx
-    dy = ypos - lasty
-    lastx = xpos
-    lasty = ypos
-
-    # no buttons down: nothing to do
-    if (not button_left) and (not button_middle) and (not button_right):
-        return
-
-    # get current window size
+    global lastx, lasty
+    dx, dy = xpos - lastx, ypos - lasty
+    lastx, lasty = xpos, ypos
+    if not (button_left or button_right): return
     width, height = glfw.get_window_size(window)
-
-    # get shift key state
-    PRESS_LEFT_SHIFT = glfw.get_key(
-        window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS
-    PRESS_RIGHT_SHIFT = glfw.get_key(
-        window, glfw.KEY_RIGHT_SHIFT) == glfw.PRESS
-    mod_shift = (PRESS_LEFT_SHIFT or PRESS_RIGHT_SHIFT)
-
-    # determine action based on mouse button
-    if button_right:
-        if mod_shift:
-            action = mj.mjtMouse.mjMOUSE_MOVE_H
-        else:
-            action = mj.mjtMouse.mjMOUSE_MOVE_V
-    elif button_left:
-        if mod_shift:
-            action = mj.mjtMouse.mjMOUSE_ROTATE_H
-        else:
-            action = mj.mjtMouse.mjMOUSE_ROTATE_V
-    else:
-        action = mj.mjtMouse.mjMOUSE_ZOOM
-
-    mj.mjv_moveCamera(model, action, dx/height,
-                      dy/height, scene, cam)
+    action = mj.mjtMouse.mjMOUSE_ROTATE_V if button_left else mj.mjtMouse.mjMOUSE_MOVE_V
+    mj.mjv_moveCamera(model, action, dx/height, dy/height, scene, cam)
 
 def scroll(window, xoffset, yoffset):
-    action = mj.mjtMouse.mjMOUSE_ZOOM
-    mj.mjv_moveCamera(model, action, 0.0, -0.05 *
-                      yoffset, scene, cam)
+    mj.mjv_moveCamera(model, mj.mjtMouse.mjMOUSE_ZOOM, 0, -0.05 * yoffset, scene, cam)
 
+def IK_controller(model, data, X_ref, q_pos):
+    site_id = 0
+    cur_pos = data.site_xpos[site_id]
+    cur_mat = data.site_xmat[site_id].reshape(3, 3)
+    R_ref = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]]) 
+    err = np.concatenate([X_ref - cur_pos, 0.5*(np.cross(cur_mat[:,0], R_ref[:,0])+np.cross(cur_mat[:,1], R_ref[:,1])+np.cross(cur_mat[:,2], R_ref[:,2]))])
+    jacp, jacr = np.zeros((3, model.nv)), np.zeros((3, model.nv))
+    mj.mj_jacSite(model, data, jacp, jacr, site_id)
+    J = np.vstack([jacp, jacr])
+    dq = J.T @ np.linalg.solve(J @ J.T + 0.15**2 * np.eye(6), err)
+    return q_pos + dq * 0.5
 
-############################
-# 模型加载与环境配置
-############################
-xml_path = 'D:/Final Project of Robowriter/models/universal_robots_ur5e/scene.xml'
-simend = 180.0 
+# ==========================================
+# 4. 轨迹规划与排序
+# ==========================================
+stroke_data_path = "stroke_data.npy"
+if not os.path.exists(stroke_data_path):
+    print("错误: 找不到数据文件"); exit()
 
-script_dir = os.path.dirname(__file__)
-xml_full = os.path.abspath(os.path.join(script_dir, xml_path)) 
+strokes = np.load(stroke_data_path, allow_pickle=True)
 
-if not os.path.exists(xml_full):
-    print(f"ERROR: XML path not found at {xml_full}")
-    # 如果报错，请在这里手动填入你的绝对路径
-    # xml_full = "/YOUR/ABSOLUTE/PATH/TO/scene.xml"
+def get_stroke_center(s):
+    pts = np.array(s)
+    return np.mean(pts[:, 0]), np.mean(pts[:, 1])
 
-model = mj.MjModel.from_xml_path(xml_full)
+indexed_strokes = []
+for s in strokes:
+    if len(s) < 2: continue
+    cx, cy = get_stroke_center(s)
+    indexed_strokes.append({'s': s, 'cx': cx, 'cy': cy})
+
+row_threshold = 0.05 
+strokes_sorted = sorted(indexed_strokes, key=lambda k: (round(k['cy'] / row_threshold), k['cx']))
+strokes = [item['s'] for item in strokes_sorted]
+
+rect_center = np.array([(X_MAX+X_MIN)/2, (Y_MAX+Y_MIN)/2])+np.array([0, 0.08])  # 调整整体位置
+all_pts_flat = np.vstack([s for s in strokes])
+raw_min, raw_max = all_pts_flat.min(axis=0), all_pts_flat.max(axis=0)
+raw_center = (raw_max + raw_min) / 2.0
+auto_scale = min((X_MAX-X_MIN)/(raw_max[0]-raw_min[0]), (Y_MAX-Y_MIN)/(raw_max[1]-raw_min[1])) * PADDING
+
+image_plan = []
+for s in strokes:
+    pts = []
+    
+    Y_OFFSET = 0.00  # 字体向上移动的距离（单位：米）。0.05 表示向上移动 5 厘米
+
+    for p in s:
+        nx = rect_center[0] + (p[0] - raw_center[0]) * auto_scale
+        ny = rect_center[1] - (p[1] - raw_center[1]) * auto_scale + Y_OFFSET # 加上偏移量
+        
+        # 确保加上偏移后不会超出定义的 Y_MAX
+        pts.append(np.array([np.clip(nx, X_MIN, X_MAX), 
+                             np.clip(ny, Y_MIN, Y_MAX), 
+                             Z_WRITE]))
+    
+    p_start = pts[0]
+    image_plan.append((p_start + [0, 0, 0.05], p_start + [0, 0, 0.05], 0.4 * SLOWDOWN_FACTOR, False))
+    image_plan.append((p_start + [0, 0, 0.05], p_start, 0.2 * SLOWDOWN_FACTOR, False))
+    
+    if USE_BEZIER:
+        image_plan.extend(get_bezier_plan(pts))
+    else:
+        image_plan.extend(get_linear_plan(pts))
+    
+    image_plan.append((pts[-1], pts[-1] + [0, 0, 0.05], 0.2 * SLOWDOWN_FACTOR, False))
+
+plan = image_plan
+cum = np.cumsum([0] + [p[2] for p in plan])
+writing_time = cum[-1]
+final_time = writing_time + STOP_MOVE_DURATION
+
+# ==========================================
+# 5. MuJoCo 初始化
+# ==========================================
+xml_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../models/universal_robots_ur5e/scene.xml'))
+model = mj.MjModel.from_xml_path(xml_path)
 data = mj.MjData(model)
-
-# 提高物理引擎步进精度
-model.opt.timestep = 0.001 
-
-cam = mj.MjvCamera()
-opt = mj.MjvOption()
+model.opt.timestep = 0.002
 
 glfw.init()
-window = glfw.create_window(1600, 900, "Stable Vertical Writing", None, None)
+window = glfw.create_window(1400, 900, "Ordered Multi-Interpolation", None, None)
 glfw.make_context_current(window)
-# --- 在这里注册回调函数 ---
-glfw.set_key_callback(window, keyboard)
 glfw.set_cursor_pos_callback(window, mouse_move)
 glfw.set_mouse_button_callback(window, mouse_button)
 glfw.set_scroll_callback(window, scroll)
 
-mj.mjv_defaultCamera(cam)
-scene = mj.MjvScene(model, maxgeom=10000)
+scene = mj.MjvScene(model, maxgeom=MAX_GEOM_LIMIT)
 context = mj.MjrContext(model, mj.mjtFontScale.mjFONTSCALE_150.value)
+# ==========================================
+# 5. MuJoCo 初始化 (视角调整部分)
+# ==========================================
 
-# 初始位姿 (确保起始状态接近垂直，避开奇异姿态)
-data.qpos[:] = np.array([-1.6, -1.3, 2.1, -2.6, -1.57, 0])
-mj.mj_forward(model, data)
 
-cam.lookat = np.array([0.0, 0.32, 0.05])
-cam.distance = 1.2
+cam = mj.MjvCamera()
+mj.mjv_defaultCamera(cam)
 
-############################
-# 轨迹规划 (写 "刘" - 简化版)
-############################
-z_write = 0.1  # 严格符合项目要求
-z_lift = 0.15  # 抬笔高度
+# 设置目标点为写字区域的中心
+cam.lookat = [0, 0.35, 0] 
 
-# 定义“刘”字各个关键点 (居中放置)
-# 左半部分 (文)
-p_dot_s = np.array([-0.2237490060074, 0.5344489582474, z_write])  # 点
-p_dot_e = np.array([-0.2120797753758, 0.5173097757573, z_write])
-
-p_heng_s = np.array([-0.2480249172111, 0.5098709538317, z_write]) # 横
-p_heng_e = np.array([-0.1793630381269, 0.523846380548, z_write])
-
-p_pie_s = np.array([-0.1940682161563, 0.520853291214, z_write])  # 撇
-p_pie_e = np.array([-0.2352647449919, 0.458830264955, z_write])
-
-p_dian_s = np.array([-0.2291884725066, 0.4995412906067, z_write]) # 捺/点
-p_dian_e = np.array([-0.1890850741034, 0.478274336908, z_write])
-
-# 右半部分 (立刀旁)
-p_shu_s = np.array([-0.168091834841, 0.5093199018429, z_write])   # 短竖
-p_shu_e = np.array([-0.1684257476533, 0.4855658638904, z_write])
-
-p_shugou_s = np.array([-0.1549512786255, 0.5434787351868, z_write]) # 竖钩
-p_shugou_m = np.array([-0.1537336222181, 0.4483883823397, z_write])
-p_shugou_e = np.array([-0.168091834841, 0.4593199018429, z_write])
-
-plan = []
-
-def add_stroke(p0, p1, dur, contact):
-    plan.append((p0, p1, dur, contact))
-
-# --- 1. 写点 ---
-add_stroke(p_dot_s + [0, 0, 0.05], p_dot_s, 0.5, False) # 下笔
-add_stroke(p_dot_s, p_dot_e, 0.5, True)                # 笔画
-add_stroke(p_dot_e, p_dot_e + [0, 0, 0.05], 0.3, False) # 抬笔
-
-# --- 2. 写横 ---
-add_stroke(p_dot_e + [0, 0, 0.05], p_heng_s + [0, 0, 0.05], 0.5, False) # 移动
-add_stroke(p_heng_s + [0, 0, 0.05], p_heng_s, 0.3, False)
-add_stroke(p_heng_s, p_heng_e, 1.0, True)
-add_stroke(p_heng_e, p_heng_e + [0, 0, 0.05], 0.3, False)
-
-# --- 3. 写撇 ---
-add_stroke(p_heng_e + [0, 0, 0.05], p_pie_s + [0, 0, 0.05], 0.5, False)
-add_stroke(p_pie_s + [0, 0, 0.05], p_pie_s, 0.3, False)
-add_stroke(p_pie_s, p_pie_e, 0.8, True)
-add_stroke(p_pie_e, p_pie_e + [0, 0, 0.05], 0.3, False)
-
-# --- 4. 写点 (右下) ---
-add_stroke(p_pie_e + [0, 0, 0.05], p_dian_s + [0, 0, 0.05], 0.5, False)
-add_stroke(p_dian_s + [0, 0, 0.05], p_dian_s, 0.3, False)
-add_stroke(p_dian_s, p_dian_e, 0.6, True)
-add_stroke(p_dian_e, p_dian_e + [0, 0, 0.05], 0.3, False)
-
-# --- 5. 写短竖 ---
-add_stroke(p_dian_e + [0, 0, 0.05], p_shu_s + [0, 0, 0.05], 0.7, False)
-add_stroke(p_shu_s + [0, 0, 0.05], p_shu_s, 0.3, False)
-add_stroke(p_shu_s, p_shu_e, 0.7, True)
-add_stroke(p_shu_e, p_shu_e + [0, 0, 0.05], 0.3, False)
-
-# --- 6. 写竖钩 ---
-add_stroke(p_shu_e + [0, 0, 0.05], p_shugou_s + [0, 0, 0.05], 0.5, False)
-add_stroke(p_shugou_s + [0, 0, 0.05], p_shugou_s, 0.3, False)
-add_stroke(p_shugou_s, p_shugou_m, 1.2, True) # 竖
-add_stroke(p_shugou_m, p_shugou_e, 0.4, True) # 钩
-add_stroke(p_shugou_e, p_shugou_e + [0, 0, 0.1], 1.0, False) # 最终抬笔
-
-cum = np.cumsum([0] + [p[2] for p in plan])
-total_time = cum[-1]
+# 核心设置：竖直向下看
+cam.elevation = -90.0  # 仰角设为 -90 度
+cam.azimuth = 90.0     # 方位角设为 90 度（可以根据需要调整 0, 90, 180, 270）
+cam.distance = 1.0     # 相机距离目标点的距离，根据字迹大小调整
+data.qpos[:] = [-1.57, -1.57, 1.57, -1.57, -1.57, 0]
 traj_points = []
+q_at_end = data.qpos.copy()
+is_finished = False
 
-############################
-# 主循环
-############################
+# --- 新增：关节状态记录容器 ---
+joint_data_history = []
+time_history = []
+plot_shown = False 
+
+# --- 6. 主循环 ---
 while not glfw.window_should_close(window):
-    sim_time = data.time
-    
-    if sim_time < simend:
-        # 高频控制循环 (200Hz)
-        while data.time - sim_time < 0.005:
-            s = min(data.time, total_time)
-            idx = np.searchsorted(cum, s, side='right') - 1
-            idx = np.clip(idx, 0, len(plan)-1)
-            
-            p0, p1, dur, contact = plan[idx]
-            tau = (s - cum[idx]) / max(dur, 1e-6)
-            tau = np.clip(tau, 0.0, 1.0)
-            X_ref = p0 + tau * (p1 - p0)
-            
-            # 1. 计算 IK 目标位置
-            prev_qpos = data.qpos.copy()
-            new_qpos = IK_controller(model, data, X_ref, prev_qpos)
-            
-            # 2. 关键同步：更新 qpos 的同时手动计算 qvel
-            # 物理引擎如果只看到 qpos 突变而没有速度，会产生巨大的虚假穿透力导致抽风
-            data.qvel[:] = (new_qpos - prev_qpos) / model.opt.timestep
-            data.qpos[:] = new_qpos
-            
-            # 3. 物理步进
-            mj.mj_step(model, data)
-            
-            if contact:
-                traj_points.append(data.site_xpos[0].copy())
-    
+    s = data.time
+    if not is_finished:
+        # --- 新增：记录当前时刻的关节角度和时间 ---
+        joint_data_history.append(data.qpos.copy())
+        time_history.append(s)
+
+        if s < writing_time:
+            for _ in range(int(RENDER_BATCH_SIZE)):
+                if data.time >= writing_time: break
+                idx = np.searchsorted(cum, data.time, side='right') - 1
+                idx = np.clip(idx, 0, len(plan)-1)
+                p0, p1, dur, contact = plan[idx]
+                tau = np.clip((data.time - cum[idx]) / max(dur, 1e-6), 0, 1)
+                if USE_SMOOTH_STEP: tau = s_curve_interp(tau)
+                X_ref = p0 + tau * (p1 - p0)
+                prev_q = data.qpos.copy()
+                data.qpos[:] = IK_controller(model, data, X_ref, prev_q)
+                data.qvel[:] = (data.qpos - prev_q) / model.opt.timestep
+                mj.mj_step(model, data)
+                if contact and abs(data.site_xpos[0][2] - Z_WRITE) < 0.005:
+                    if int(data.time * 1000) % 3 == 0:
+                        vel = np.linalg.norm(data.qvel)
+                        radius = max(0.0015, 0.004 - vel * 0.0006) if DYNAMIC_THICKNESS else 0.002
+                        traj_points.append((data.site_xpos[0].copy(), radius))
+            q_at_end = data.qpos.copy()
+        elif s < final_time:
+            for _ in range(int(RENDER_BATCH_SIZE)):
+                tau_stop = np.clip((data.time - writing_time) / STOP_MOVE_DURATION, 0, 1)
+                tau_smooth = s_curve_interp(tau_stop)
+                data.qpos[:] = q_at_end + tau_smooth * (Q_STOP - q_at_end)
+                data.qvel[:] = 0
+                mj.mj_step(model, data)
+        else:
+            is_finished = True
+    else:
+        # --- 新增：当任务结束时，绘制曲线 ---
+        if not plot_shown:
+            joint_history_np = np.array(joint_data_history)
+            plt.figure(figsize=(10, 6))
+            for i in range(model.nq):
+                plt.plot(time_history, joint_history_np[:, i], label=f'Joint {i+1}')
+            plt.xlabel('Time (s)')
+            plt.ylabel('Joint Angle (rad)')
+            plt.title('Joint States Over Time')
+            plt.legend()
+            plt.grid(True)
+            plt.show() # 注意：这会阻塞程序直到关闭图片窗口
+            plot_shown = True
+
+        data.qpos[:] = Q_STOP
+        data.qvel[:] = 0
+        mj.mj_forward(model, data)
+
     # 渲染
     viewport = mj.MjrRect(0, 0, *glfw.get_framebuffer_size(window))
-    mj.mjv_updateScene(model, data, opt, None, cam, mj.mjtCatBit.mjCAT_ALL.value, scene)
-    
-    # 绘制轨迹
-    for p in traj_points[::10]: # 抽样绘制，减轻渲染压力
+    mj.mjv_updateScene(model, data, mj.MjvOption(), None, cam, 3, scene)
+    for p, r in traj_points[::DRAW_SKIP_STEP]:
         if scene.ngeom < scene.maxgeom:
-            g = scene.geoms[scene.ngeom]
+            mj.mjv_initGeom(scene.geoms[scene.ngeom], 2, [r,0,0], p, np.eye(3).flatten(), [0, 0.5, 1, 1])
             scene.ngeom += 1
-            mj.mjv_initGeom(g, mj.mjtGeom.mjGEOM_SPHERE, [0.003,0,0], p, np.eye(3).flatten(), [0, 0.8, 1, 1])
-    
     mj.mjr_render(viewport, scene, context)
-    glfw.swap_buffers(window)
-    glfw.poll_events()
+    glfw.swap_buffers(window); glfw.poll_events()
 
 glfw.terminate()
