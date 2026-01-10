@@ -2,18 +2,14 @@ import mujoco as mj
 from mujoco.glfw import glfw
 import numpy as np
 import os
+import matplotlib.pyplot as plt
 
 # ==========================================
 # 1. 核心参数
 # ==========================================
 SPHERE_CENTER = np.array([0.0, 0.35, 1.3])
-<<<<<<< HEAD:Project Implemantation/code/scripts/ball.py
 SPHERE_R = 1.3  # 球面半径
 ROBOT_REACH = 0.82 # 机械臂最大可达距离
-=======
-SPHERE_R = 1.3
-ROBOT_REACH = 0.82
->>>>>>> c8cfe3dbfe4cc7553b5c6accab06bee97f69a348:scripts/ball.py
 EE_SITE_NAME = "ee_site"
 
 button_left, button_right = False, False
@@ -39,10 +35,9 @@ def scroll(window, xoffset, yoffset):
 # 2. 映射逻辑 (抬高目标点，避免物理限制)
 # ==========================================
 def project_to_reachable_sphere(nx, ny, lift_offset=0):
-<<<<<<< HEAD:Project Implemantation/code/scripts/ball.py
     # --- 1. 控制字的大小 ---
     # 0.2 左右在侧壁投影会显得比较合适
-    scale_factor = 0.1  
+    scale_factor = 0.2  
     
     # --- 2. 构造侧壁引导点 ---
     # 我们让目标点位于球体前方（Y轴增加）且稍微偏上的位置
@@ -51,16 +46,10 @@ def project_to_reachable_sphere(nx, ny, lift_offset=0):
     target_y = (ny * scale_factor) + 0.65 
     # 引导点设为 0.05，确保它是向斜下方投影
     target_z = 0.05 
-=======
-    target_x = nx * 0.25
-    target_y = -0.1 + (ny * 0.25)
-    target_z = 0.85 
->>>>>>> c8cfe3dbfe4cc7553b5c6accab06bee97f69a348:scripts/ball.py
     
     virtual_p = np.array([target_x, target_y, target_z])
     direction = virtual_p - SPHERE_CENTER
     direction /= np.linalg.norm(direction)
-<<<<<<< HEAD:Project Implemantation/code/scripts/ball.py
     
     # --- 3. 投影到球面 ---
     # lift_offset 为正时提笔（向球心收缩），为 0 时落笔（在球面上）
@@ -79,16 +68,6 @@ def project_to_reachable_sphere(nx, ny, lift_offset=0):
         p_final = (p_final / dist_to_base) * ROBOT_REACH
         
     return p_final
-=======
-    p_final = SPHERE_CENTER + direction * (SPHERE_R - lift_offset)
-    
-    if p_final[2] < 0.05: p_final[2] = 0.05
-    dist_to_base = np.linalg.norm(p_final)
-    if dist_to_base > ROBOT_REACH:
-        p_final = (p_final / dist_to_base) * ROBOT_REACH
-    return p_final
-
->>>>>>> c8cfe3dbfe4cc7553b5c6accab06bee97f69a348:scripts/ball.py
 # ==========================================
 # 3. 强化版 IK 控制器 (强制 Elbow-Up)
 # ==========================================
@@ -128,17 +107,10 @@ def IK_controller(model, data, target_pos, target_quat, site_id):
 # ==========================================
 # 4. 初始化与计划
 # ==========================================
-<<<<<<< HEAD:Project Implemantation/code/scripts/ball.py
 xml_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'D:/MuHaoyan ZhangJiyun LiuLihe _Final Project/Project Implemantation/code/models/universal_robots_ur5e/scene.xml'))
 model = mj.MjModel.from_xml_path(xml_path)
 data = mj.MjData(model)
 sid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, EE_SITE_NAME)  # 获取末端执行器站点ID
-=======
-xml_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../models/universal_robots_ur5e/scene.xml'))
-model = mj.MjModel.from_xml_path(xml_path)
-data = mj.MjData(model)
-sid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, EE_SITE_NAME)
->>>>>>> c8cfe3dbfe4cc7553b5c6accab06bee97f69a348:scripts/ball.py
 if sid == -1: sid = 0
 
 strokes = np.load("stroke_data.npy", allow_pickle=True)
@@ -146,7 +118,6 @@ all_pts = np.vstack([s for s in strokes if len(s) > 1])
 center, scale = (all_pts.min(0) + all_pts.max(0))/2, np.max(all_pts.max(0)-all_pts.min(0))
 
 full_plan = []
-<<<<<<< HEAD:Project Implemantation/code/scripts/ball.py
 LIFT_VAL = 0.04  # 提笔高度 (5cm)
 WAIT_DUR = 0.15   # 提笔/落笔动作耗时
 
@@ -174,18 +145,6 @@ for stroke in strokes:
     full_plan.append((pts_on_sphere[-1], pts_lifted[-1], WAIT_DUR, False))
 
 cum_time = np.cumsum([0] + [p[2] for p in full_plan])
-=======
-for stroke in strokes:
-    if len(stroke) < 2: continue
-    pts = [project_to_reachable_sphere((p[0]-center[0])/(scale/2), -(p[1]-center[1])/(scale/2)) for p in stroke]
-    full_plan.append((pts[0], pts[0], 0.1, False)) 
-    for i in range(len(pts)-1):
-        full_plan.append((pts[i], pts[i+1], 0.01, True)) 
-    full_plan.append((pts[-1], pts[-1], 0.1, False))
-
-cum_time = np.cumsum([0] + [p[2] for p in full_plan])
-
->>>>>>> c8cfe3dbfe4cc7553b5c6accab06bee97f69a348:scripts/ball.py
 # 初始位姿：强制高耸
 data.qpos[:] = [0, -0.8, 1.8, -2.5, -1.57, 0]
 mj.mj_forward(model, data)
@@ -206,8 +165,10 @@ cam = mj.MjvCamera(); mj.mjv_defaultCamera(cam)
 cam.lookat = [0, 0, 0.8]; cam.distance = 2.5
 
 traj_points = []
+# 新增：用于绘图的数据容器
+joint_data_log = []  # 存储 qpos
+time_log = []        # 存储对应的仿真时间
 
-<<<<<<< HEAD:Project Implemantation/code/scripts/ball.py
 # --- 1. 在循环外定义固定参数 ---
 Q_HOME = np.array([0.0, -2.32, -1.38, -2.45, 1.57, 0.0])
 # --- 建议在循环外稍微调大 HOME_DURATION 以确保末尾停稳 ---
@@ -229,17 +190,6 @@ while not glfw.window_should_close(window):
             target_pos = p0 + (p1 - p0) * (tau**2 * (3 - 2 * tau))
             
             # 朝向计算
-=======
-while not glfw.window_should_close(window):
-    if data.time < cum_time[-1]:
-        for _ in range(40):
-            if data.time >= cum_time[-1]: break
-            idx = np.searchsorted(cum_time, data.time, side='right') - 1
-            p0, p1, dur, is_writing = full_plan[np.clip(idx, 0, len(full_plan)-1)]
-            tau = np.clip((data.time - cum_time[idx])/dur, 0, 1)
-            target_pos = p0 + (p1 - p0) * (tau**2 * (3 - 2 * tau))
-            
->>>>>>> c8cfe3dbfe4cc7553b5c6accab06bee97f69a348:scripts/ball.py
             z_dir = target_pos - SPHERE_CENTER; z_dir /= np.linalg.norm(z_dir)
             y_tmp = np.array([0, 0, 1]); x_dir = np.cross(y_tmp, z_dir); x_dir /= np.linalg.norm(x_dir)
             y_dir = np.cross(z_dir, x_dir); target_quat = np.zeros(4)
@@ -247,7 +197,6 @@ while not glfw.window_should_close(window):
             
             old_q = data.qpos.copy()
             dq = IK_controller(model, data, target_pos, target_quat, sid)
-<<<<<<< HEAD:Project Implemantation/code/scripts/ball.py
             
             # --- 核心改进：如果是提笔状态 (is_writing=False)，加大步长系数 ---
             step_gain = 0.95 if not is_writing else 0.6 
@@ -258,6 +207,13 @@ while not glfw.window_should_close(window):
             data.qvel[:6] = (data.qpos[:6] - old_q[:6]) / (model.opt.timestep * vel_smooth)
             
             mj.mj_step(model, data)
+
+            if is_writing: 
+                # 记录末端轨迹点用于实时显示
+                traj_points.append(data.site_xpos[sid].copy())
+                # 新增：记录 6 个关节的当前角度 (qpos) 和 时间，用于最后绘图
+                joint_data_log.append(data.qpos[:6].copy())
+                time_log.append(data.time)
             
             # 仅在书写状态记录轨迹 
             if is_writing: 
@@ -282,14 +238,6 @@ while not glfw.window_should_close(window):
         mj.mj_forward(model, data)
 
     # --- 后续渲染逻辑保持不变 ---
-=======
-            data.qpos[:] += dq * 0.8
-            data.qvel[:] = (data.qpos - old_q) / (model.opt.timestep * 10)
-            mj.mj_step(model, data)
-            if is_writing: traj_points.append(data.site_xpos[sid].copy())
-    else:
-        mj.mj_step(model, data)
->>>>>>> c8cfe3dbfe4cc7553b5c6accab06bee97f69a348:scripts/ball.py
 
     viewport = mj.MjrRect(0, 0, *glfw.get_framebuffer_size(window))
     mj.mjv_updateScene(model, data, mj.MjvOption(), None, cam, 3, scene)
@@ -306,3 +254,25 @@ while not glfw.window_should_close(window):
     glfw.poll_events()
 
 glfw.terminate()
+# ==========================================
+# 新增：绘制关节状态曲线
+# ==========================================
+if joint_data_log:
+    joint_data_log = np.array(joint_data_log)
+    time_log = np.array(time_log)
+
+    plt.figure(figsize=(10, 6))
+    for i in range(6):
+        plt.plot(time_log, joint_data_log[:, i], label=f'Joint {i+1}')
+
+    plt.title('Joint States During Writing (Chinese Family Name)')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Joint Position (rad)')
+    plt.legend(loc='upper right')
+    plt.grid(True)
+    
+    # 自动保存图片，方便放入报告和 PPT
+    plt.savefig("joint_states_plot.png")
+    print("Joint states plot saved as joint_states_plot.png")
+    
+    plt.show()
